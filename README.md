@@ -51,5 +51,3 @@ python main.py
 
 El script producirá un informe HTML enviado por correo y adjuntará el mapa
 `ssh-attack-map.html` con los orígenes de los ataques SSH más recientes.
-Siempre que haya datos de geolocalización disponibles, el informe mostrará la
-ciudad, el país y el proveedor (ISP) de cada IP destacada.

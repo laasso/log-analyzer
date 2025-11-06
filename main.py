@@ -181,7 +181,7 @@ def geolocate_ips(ip_counter):
         try:
             resp = requests.get(
                 f"http://ip-api.com/json/{ip}",
-                params={"fields": "status,message,country,city,lat,lon,isp"},
+                params={"fields": "status,message,country,city,lat,lon"},
                 timeout=5,
             )
             data = resp.json()
@@ -191,7 +191,6 @@ def geolocate_ips(ip_counter):
                     "lon": data["lon"],
                     "country": data.get("country"),
                     "city": data.get("city"),
-                    "isp": data.get("isp"),
                     "ts": now,
                 }
                 cache[ip] = info
@@ -208,15 +207,14 @@ def geolocate_ips(ip_counter):
     return results
 
 
-def generate_attack_map(ip_counter, geo_info=None):
+def generate_attack_map(ip_counter):
     if not SSH_MAP_ENABLED:
         return None
     if folium is None:
         print("[WARN] La librería opcional 'folium' no está instalada; no se generará el mapa.", file=sys.stderr)
         return None
 
-    if geo_info is None:
-        geo_info = geolocate_ips(ip_counter)
+    geo_info = geolocate_ips(ip_counter)
     if not geo_info:
         return None
 
@@ -228,17 +226,8 @@ def generate_attack_map(ip_counter, geo_info=None):
         if not info:
             continue
         radius = 4 + 6 * (count / max_count) if max_count else 5
-        location_bits = []
-        city = info.get("city")
-        country = info.get("country")
-        if city or country:
-            location_bits.append(", ".join(bit for bit in (city, country) if bit))
-        isp = info.get("isp")
-        if isp:
-            location_bits.append(isp)
-        extra = "<br/>".join(location_bits) if location_bits else "Ubicación desconocida"
         popup = folium.Popup(
-            f"<strong>{ip}</strong><br/>Intentos: {count}<br/>{extra}",
+            f"<strong>{ip}</strong><br/>Intentos: {count}<br/>{info.get('city', 'Ciudad desconocida')}, {info.get('country', 'País desconocido')}",
             max_width=250,
         )
         folium.CircleMarker(
@@ -384,24 +373,11 @@ def send_mail(subject, html_body, attachments=None):
 if __name__ == "__main__":
     attacks = analyze()
     total, nets = summarize(attacks)
-
-    geo_targets = Counter()
-    for svc, ctr in attacks.items():
-        for ip, _ in ctr.most_common(5):
-            geo_targets[ip] = max(geo_targets.get(ip, 0), ctr[ip])
-    for ip, _ in total.most_common(10):
-        geo_targets[ip] = max(geo_targets.get(ip, 0), total[ip])
-
-    ssh_attacks = attacks.get("Servidor SSH", Counter())
-    if SSH_MAP_ENABLED:
-        for ip, count in ssh_attacks.items():
-            geo_targets[ip] = max(geo_targets.get(ip, 0), count)
-
-    geo_info = geolocate_ips(geo_targets) if geo_targets else {}
-    html = report_html(attacks, total, nets, geo_info)
+    html = report_html(attacks, total, nets)
 
     attachments = []
-    map_file = generate_attack_map(ssh_attacks, geo_info)
+    ssh_attacks = attacks.get("Servidor SSH", Counter())
+    map_file = generate_attack_map(ssh_attacks)
     if map_file:
         attachments.append(map_file)
         html = html.replace(
