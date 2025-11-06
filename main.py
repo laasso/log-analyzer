@@ -1,13 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, gzip, socket, sys
+import json
+import os
+import re
+import gzip
+import socket
+import sys
+import time
+import mimetypes
+from pathlib import Path
 from dotenv import load_dotenv
 from glob import glob
 from datetime import datetime, timedelta
 from ipaddress import ip_address, ip_network
 from collections import Counter
 from email.message import EmailMessage
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - fallback when dependency missing
+    requests = None
+
+# The map feature depends on folium. Import lazily to keep the script usable even
+# without the optional dependency installed.
+try:
+    import folium  # type: ignore
+except ImportError:  # pragma: no cover - we handle the absence later
+    folium = None
 
 load_dotenv()
 
@@ -19,6 +39,11 @@ SMTP_HOST    = os.getenv("SMTP_HOST")
 SMTP_PORT    = int(os.getenv("SMTP_PORT", 587))
 SMTP_USER    = os.getenv("SMTP_USER")
 SMTP_PASS    = os.getenv("SMTP_PASS")
+
+SSH_MAP_ENABLED   = os.getenv("SSH_MAP_ENABLED", "true").lower() == "true"
+SSH_MAP_FILE      = Path(os.getenv("SSH_MAP_FILE", "ssh-attack-map.html"))
+SSH_MAP_CACHE     = Path(os.getenv("SSH_MAP_CACHE", "~/.cache/log-analyzer/ip-geolocation.json")).expanduser()
+SSH_MAP_CACHE_MAX = int(os.getenv("SSH_MAP_CACHE_MAX_AGE", 7 * 24 * 3600))
 
 NET_PREFIX  = int(os.getenv("NET_PREFIX", 16))
 SERVICES    = [s.strip() for s in os.getenv("SERVICES", "Servidor Web,Servidor SSH,Servidor SMTP").split(",")]
@@ -35,6 +60,33 @@ def collect(globs):
 def is_private(ip):
     try: return ip_address(ip).is_private
     except: return True
+
+
+def ensure_parent(path: Path):
+    """Ensure that the parent directory for *path* exists."""
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_cache(path: Path):
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_cache(path: Path, data):
+    try:
+        ensure_parent(path)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        tmp_path.replace(path)
+    except Exception as exc:
+        print(f"[WARN] No se pudo guardar la caché {path}: {exc}", file=sys.stderr)
 
 # ========= Parsers ==========
 def parse_web(line):
@@ -107,6 +159,91 @@ def summarize(attacks):
         except: pass
     return total, nets
 
+
+def geolocate_ips(ip_counter):
+    """Return mapping of IP to geolocation dictionary using ip-api.com."""
+    if not ip_counter or requests is None:
+        if requests is None and ip_counter:
+            print("[WARN] La librería 'requests' no está disponible; no se generará el mapa.", file=sys.stderr)
+        return {}
+
+    cache = load_cache(SSH_MAP_CACHE)
+    now = time.time()
+    updated = False
+    results = {}
+
+    for ip in ip_counter:
+        info = cache.get(ip)
+        if info and now - info.get("ts", 0) <= SSH_MAP_CACHE_MAX:
+            results[ip] = info
+            continue
+
+        try:
+            resp = requests.get(
+                f"http://ip-api.com/json/{ip}",
+                params={"fields": "status,message,country,city,lat,lon"},
+                timeout=5,
+            )
+            data = resp.json()
+            if data.get("status") == "success" and {"lat", "lon"} <= data.keys():
+                info = {
+                    "lat": data["lat"],
+                    "lon": data["lon"],
+                    "country": data.get("country"),
+                    "city": data.get("city"),
+                    "ts": now,
+                }
+                cache[ip] = info
+                results[ip] = info
+                updated = True
+            else:
+                print(f"[WARN] No se pudo geolocalizar {ip}: {data.get('message', 'respuesta desconocida')}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[WARN] Error consultando geolocalización de {ip}: {exc}", file=sys.stderr)
+
+    if updated:
+        save_cache(SSH_MAP_CACHE, cache)
+
+    return results
+
+
+def generate_attack_map(ip_counter):
+    if not SSH_MAP_ENABLED:
+        return None
+    if folium is None:
+        print("[WARN] La librería opcional 'folium' no está instalada; no se generará el mapa.", file=sys.stderr)
+        return None
+
+    geo_info = geolocate_ips(ip_counter)
+    if not geo_info:
+        return None
+
+    fmap = folium.Map(location=[20, 0], zoom_start=2, tiles="CartoDB positron")
+
+    max_count = max(ip_counter.values()) if ip_counter else 0
+    for ip, count in ip_counter.items():
+        info = geo_info.get(ip)
+        if not info:
+            continue
+        radius = 4 + 6 * (count / max_count) if max_count else 5
+        popup = folium.Popup(
+            f"<strong>{ip}</strong><br/>Intentos: {count}<br/>{info.get('city', 'Ciudad desconocida')}, {info.get('country', 'País desconocido')}",
+            max_width=250,
+        )
+        folium.CircleMarker(
+            location=[info["lat"], info["lon"]],
+            radius=radius,
+            color="#e84118",
+            fill=True,
+            fill_color="#e84118",
+            fill_opacity=0.7,
+            popup=popup,
+        ).add_to(fmap)
+
+    ensure_parent(SSH_MAP_FILE)
+    fmap.save(str(SSH_MAP_FILE))
+    return SSH_MAP_FILE
+
 # ========= HTML Report ==========
 def report_html(attacks, total, nets):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -176,13 +313,31 @@ def report_html(attacks, total, nets):
     return html
 
 # ========= Envío correo ==========
-def send_mail(subject, html_body):
+def attach_file(msg: EmailMessage, file_path: Path):
+    try:
+        with file_path.open("rb") as fh:
+            data = fh.read()
+    except Exception as exc:
+        print(f"[WARN] No se pudo adjuntar {file_path}: {exc}", file=sys.stderr)
+        return
+
+    ctype, encoding = mimetypes.guess_type(str(file_path))
+    if ctype is None or encoding is not None:
+        ctype = "application/octet-stream"
+    maintype, subtype = ctype.split("/", 1)
+    msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=file_path.name)
+
+
+def send_mail(subject, html_body, attachments=None):
     msg = EmailMessage()
     msg["From"] = MAIL_FROM
     msg["To"] = ", ".join(MAIL_TO)
     msg["Subject"] = subject
     msg.set_content("Tu cliente de correo no soporta HTML.")
     msg.add_alternative(html_body, subtype="html")
+
+    for attachment in attachments or []:
+        attach_file(msg, attachment)
 
     if USE_SENDMAIL and os.path.exists("/usr/sbin/sendmail"):
         import subprocess
@@ -200,5 +355,17 @@ if __name__ == "__main__":
     attacks = analyze()
     total, nets = summarize(attacks)
     html = report_html(attacks, total, nets)
-    send_mail(MAIL_SUBJECT, html)
+
+    attachments = []
+    ssh_attacks = attacks.get("Servidor SSH", Counter())
+    map_file = generate_attack_map(ssh_attacks)
+    if map_file:
+        attachments.append(map_file)
+        html = html.replace(
+            "<footer>",
+            "<p>🗺️ Se adjunta un mapa interactivo con los orígenes de los ataques SSH.</p><footer>",
+            1,
+        )
+
+    send_mail(MAIL_SUBJECT, html, attachments)
 
