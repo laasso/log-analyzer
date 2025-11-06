@@ -245,13 +245,32 @@ def generate_attack_map(ip_counter):
     return SSH_MAP_FILE
 
 # ========= HTML Report ==========
-def report_html(attacks, total, nets):
+def report_html(attacks, total, nets, geo_info=None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hostname = socket.gethostname()
+    geo_info = geo_info or {}
+
+    def describe_ip(ip):
+        info = geo_info.get(ip, {})
+        details = []
+        city = info.get("city")
+        country = info.get("country")
+        if city or country:
+            details.append(", ".join(bit for bit in (city, country) if bit))
+        isp = info.get("isp")
+        if isp:
+            details.append(isp)
+        if not details:
+            return ""
+        extra = "<br/>".join(details)
+        return f"<br/><small>{extra}</small>"
 
     def table(title, data):
         if not data: return ""
-        rows = "".join(f"<tr><td>{ip}</td><td>{count}</td></tr>" for ip, count in data)
+        rows = "".join(
+            f"<tr><td>{ip}{describe_ip(ip)}</td><td>{count}</td></tr>"
+            for ip, count in data
+        )
         return f"""
         <h3>{title}</h3>
         <table>
